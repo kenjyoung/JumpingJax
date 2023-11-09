@@ -57,7 +57,7 @@ parser.add_argument("--record", "-r", action='store_true', default=False)
 parser.add_argument("--seed", "-s", type=int, default=0)
 args = parser.parse_args()
 
-movement_types = {'fixed': 0, 'powder': 1, 'fluid': 2}
+movement_types = {'fixed': 0, 'powder': 1, 'fluid': 2, 'left_fluid': 3, 'right_fluid': 4}
 
 substances = {s.name:i for i, s in enumerate(substance_objects)}
 substance_names = [s.name for s in substance_objects]
@@ -94,7 +94,9 @@ move = {'n': 0, 'l': 1, 'ld': 2, 'd': 3, 'rd': 4, 'r': 5, 'ru': 6, 'u': 7,'lu':8
 
 # moves in same inner list have same priority and will be randomized
 powder_moves = move_strings_to_nums([['d'], ['ld', 'rd']])
-fluid_moves = move_strings_to_nums([['d'], ['ld', 'rd'], ['l', 'r']])
+default_fluid_moves = move_strings_to_nums([['d'], ['ld', 'rd'], ['l', 'r']])
+left_fluid_moves = move_strings_to_nums([['d'], ['l'], ['ld', 'rd'], ['r']])
+right_fluid_moves = move_strings_to_nums([['d'], ['r'], ['ld', 'rd'], ['l']])
 fixed_moves = move_strings_to_nums([])
 
 relative_position_array = jnp.asarray([(0, 0), (-1, 0), (-1, -1), (0, -1), (1, -1), (1,0), (1, 1), (0, 1), (-1,1)])
@@ -102,6 +104,9 @@ relative_position_array = jnp.asarray([(0, 0), (-1, 0), (-1, -1), (0, -1), (1, -
 key = jx.random.PRNGKey(args.seed)
 
 substance_map = jnp.full((world_size, world_size), substances['empty'], dtype=int)
+
+#stores fluid momentum (-1=left, 1=right or 0=none) for each cell
+momentum_map = jnp.zeros((world_size, world_size), dtype=int)
 
 
 def padded_map(_map, pad_val):
@@ -139,17 +144,24 @@ def get_select_move_function(moves):
                                             )
         dest_index = index - relative_position_array[m]
         dest_substance = substance_map[dest_index[0],dest_index[1]]
-        return index, dest_substance, dest_index, substance_map[index[0],index[1]]
+        return index, dest_substance, dest_index, substance_map[index[0],index[1]], m
     return jit(select_move)
 
 select_fixed_move = get_select_move_function(fixed_moves)
 select_powder_move = get_select_move_function(powder_moves)
-select_fluid_move = get_select_move_function(fluid_moves)
+select_left_fluid_move = get_select_move_function(left_fluid_moves)
+select_right_fluid_move = get_select_move_function(right_fluid_moves)
+select_default_fluid_move = get_select_move_function(default_fluid_moves)
 
 def select_move(flat_index, key, density_map, fixed_map, substance_map, movement_map):
     index = jnp.asarray(jnp.unravel_index(flat_index, density_map.shape))
 
-    return jx.lax.switch(movement_map[index[0],index[1]],(select_fixed_move, select_powder_move, select_fluid_move), index, key, density_map, fixed_map, substance_map)
+    return jx.lax.switch(movement_map[index[0],index[1]],
+                         (select_fixed_move, 
+                          select_powder_move, 
+                          select_default_fluid_move,
+                          select_left_fluid_move,
+                          select_right_fluid_move), index, key, density_map, fixed_map, substance_map)
 select_moves = jit(vmap(select_move, in_axes=(0, 0, None, None, None, None)))
 
 def get_binary_reaction_function(substance_1, substance_2):
@@ -219,33 +231,41 @@ def select_unary_reaction(flat_index, key, substance_map):
 select_unary_reactions = jit(vmap(select_unary_reaction, in_axes=(0, 0, None)))
 
 
-def step_sim(key, substance_map):
+def step_sim(key, substance_map, momentum_map):
     # pad substance map with a solid boundary to prevent movement offscreen
     #TODO: this is sub ideal since it depends on stone being defined, and probably inert to avoid boundary weirdness
     substance_map = padded_map(substance_map, substances['stone'])
+    momentum_map = padded_map(momentum_map, 0)
     key, subkey = jx.random.split(key)
     permuted_movement_index_partitions = jx.random.permutation(subkey, movement_index_partitions)
     key, subkey = jx.random.split(key)
     permuted_binary_reaction_index_partitions = jx.random.permutation(subkey,binary_reaction_index_partitions)
 
-    def movement_loop_func(substance_map_and_key, indices):
-        substance_map, key = substance_map_and_key
+    def movement_loop_func(substance_map_momentum_map_and_key, indices):
+        substance_map, momentum_map, key = substance_map_momentum_map_and_key
         density_map = jnp.take(properties_array[:, properties['mass']], substance_map)
         movement_map = jnp.take(properties_array[:, properties['movement']], substance_map).astype(int)
+        left_fluid_map = jnp.where(movement_map==movement_types['fluid'], momentum_map==-1, False)
+        right_fluid_map = jnp.where(movement_map==movement_types['fluid'], momentum_map==1, False)
+        movement_map = jnp.where(left_fluid_map, movement_types['left_fluid'], movement_map)
+        movement_map = jnp.where(right_fluid_map, movement_types['right_fluid'], movement_map)
         fixed_map = jnp.take(properties_array[:, properties['movement']], substance_map) == movement_types['fixed']
 
         key, subkey = jx.random.split(key)
         subkeys = jx.random.split(subkey, len(indices))
-        start_indices, start_substances, end_indices, end_substances = select_moves(indices, subkeys, density_map, fixed_map, substance_map, movement_map)
+        start_indices, start_substances, end_indices, end_substances, executed_move = select_moves(indices, subkeys, density_map, fixed_map, substance_map, movement_map)
 
         inds = jnp.concatenate((start_indices, end_indices))
         subs = jnp.concatenate((start_substances, end_substances))
 
         substance_map = substance_map.at[inds[:, 0], inds[:, 1]].set(subs)
-        return (substance_map, key), None
+
+        momentum_map = momentum_map.at[end_indices[:,0], end_indices[:,1]].set(jnp.where(
+            executed_move == move['l'], -1, jnp.where(executed_move == move['r'], 1, momentum_map[start_indices[:, 0], start_indices[:, 1]])))
+        return (substance_map, momentum_map, key), None
 
     def binary_reaction_loop_func(substance_map_and_key, indices):
-        substance_map, key = substance_map_and_key
+        substance_map, momentum_map, key = substance_map_and_key
         key, subkey = jx.random.split(key)
         subkeys = jx.random.split(subkey, len(indices))
         start_indices, start_substances, end_indices, end_substances = select_binary_reactions(indices, subkeys, substance_map)
@@ -254,22 +274,22 @@ def step_sim(key, substance_map):
         subs = jnp.concatenate((start_substances, end_substances))
 
         substance_map = substance_map.at[inds[:, 0], inds[:, 1]].set(subs)
-        return (substance_map, key), None
+        return (substance_map, momentum_map, key), None
 
     def unary_reaction_loop_func(substance_map_and_key, indices):
-        substance_map, key = substance_map_and_key
+        substance_map, momentum_map, key = substance_map_and_key
         key, subkey = jx.random.split(key)
         subkeys = jx.random.split(subkey, len(indices))
         inds, subs = select_unary_reactions(indices, subkeys, substance_map)
         substance_map = substance_map.at[inds[:, 0], inds[:, 1]].set(subs)
-        return (substance_map, key), None
+        return (substance_map, momentum_map, key), None
 
 
-    substance_map_and_key, _ = jx.lax.scan(movement_loop_func, (substance_map,key), permuted_movement_index_partitions)
+    substance_map_and_key, _ = jx.lax.scan(movement_loop_func, (substance_map, momentum_map,key), permuted_movement_index_partitions)
     substance_map_and_key, _ = jx.lax.scan(binary_reaction_loop_func, substance_map_and_key, permuted_binary_reaction_index_partitions)
     substance_map_and_key, _ = unary_reaction_loop_func(substance_map_and_key, unary_reaction_index_partitions[0])
-    substance_map, key = substance_map_and_key
-    return substance_map[1:-1,1:-1]
+    substance_map, momentum_map, key = substance_map_and_key
+    return substance_map[1:-1,1:-1], momentum_map[1:-1,1:-1]
 step_sim = jit(step_sim, static_argnames=('steps',))
 
 #User Interface Stuff
@@ -342,7 +362,7 @@ while not quit:
     pygame.display.update()
 
     key, subkey = jx.random.split(key)
-    substance_map = step_sim(subkey, substance_map)
+    substance_map, momentum_map = step_sim(subkey, substance_map, momentum_map)
 
     avg_fps = 0.99*avg_fps+0.01*(1/(time.time() - start))
     print("fps: "+str(avg_fps),end="\r")
